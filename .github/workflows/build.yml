@@ -1,0 +1,34 @@
+name: Build DLL
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find project folder
+        shell: pwsh
+        run: |
+          $cm = Get-ChildItem -Recurse -Filter CMakeLists.txt |
+                Where-Object { $_.DirectoryName -notmatch 'external' } |
+                Sort-Object { $_.FullName.Length } | Select-Object -First 1
+          "PROJ=$($cm.DirectoryName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "Project: $($cm.DirectoryName)"
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S "$env:PROJ" -B "$env:PROJ/build" -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build "$env:PROJ/build" --config Release
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: MCBE_DX12_ModBase-dll
+          path: ${{ env.PROJ }}/build/**/*.dll
