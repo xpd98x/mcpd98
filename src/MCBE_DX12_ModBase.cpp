@@ -9,7 +9,7 @@
 #endif
 #ifndef NOMINMAX
 #define NOMINMAX
-#endif
+#define IMGUI_DEFINE_MATH_OPERATORS
 
 #include <Windows.h>
 #include <string>
