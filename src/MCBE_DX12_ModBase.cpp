@@ -10,6 +10,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef IMGUI_DEFINE_MATH_OPERATORS
+#define IMGUI_DEFINE_MATH_OPERATORS // must come before the first imgui include
+#endif
 
 #include <Windows.h>
 #include <string>
