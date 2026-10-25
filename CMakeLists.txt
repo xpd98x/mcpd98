@@ -62,6 +62,7 @@ target_link_libraries(MCBE_DX12_ModBase PRIVATE
     imgui
     Minhook
     d3d12
+    d3d11
     dxgi
     Psapi
     libhat::libhat 
