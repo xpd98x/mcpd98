@@ -47,6 +47,8 @@
 #include <utility>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <d3d11.h>
+#include <imgui_impl_dx11.h>
 #include <imgui_impl_dx12.h>
 #include <imgui_impl_win32.h>
 #include <kiero.h>
@@ -4715,6 +4717,15 @@ namespace {
     using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
     using ExecuteCommandListsFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 
+    // ---- DirectX 11 fallback (Minecraft Bedrock runs on DX11 by default) ----
+    using PresentFn11 = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
+    using ResizeBuffersFn11 = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+    PresentFn11 g_originalPresent11 = nullptr;
+    ResizeBuffersFn11 g_originalResizeBuffers11 = nullptr;
+    ID3D11Device* g_d11Device = nullptr;
+    ID3D11DeviceContext* g_d11Context = nullptr;
+    bool g_useDx11 = false;
+
     PresentFn g_originalPresent = nullptr;
     ResizeBuffersFn g_originalResizeBuffers = nullptr;
     ExecuteCommandListsFn g_originalExecuteCommandLists = nullptr;
@@ -4949,7 +4960,11 @@ namespace {
 
         wait_for_overlay_work();
 
-        ImGui_ImplDX12_Shutdown();
+        if (g_useDx11) {
+            ImGui_ImplDX11_Shutdown();
+        } else {
+            ImGui_ImplDX12_Shutdown();
+        }
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
 
@@ -4983,6 +4998,16 @@ namespace {
         if (g_device) {
             g_device->Release();
             g_device = nullptr;
+        }
+
+        if (g_d11Context) {
+            g_d11Context->Release();
+            g_d11Context = nullptr;
+        }
+
+        if (g_d11Device) {
+            g_d11Device->Release();
+            g_d11Device = nullptr;
         }
 
         g_window = nullptr;
@@ -5169,6 +5194,127 @@ namespace {
         }
     }
 
+    bool initialize_imgui_dx11(IDXGISwapChain* swapChain) {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        if (FAILED(swapChain->GetDesc(&desc)) || !desc.OutputWindow) {
+            return false;
+        }
+
+        g_window = desc.OutputWindow;
+        LOG_INFO("Initializing ImGui DX11 overlay for window handle: {:p}...", static_cast<void*>(g_window));
+
+        if (FAILED(swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&g_d11Device))) || !g_d11Device) {
+            LOG_ERROR("Failed to acquire D3D11 device from swapchain!");
+            return false;
+        }
+        g_d11Device->GetImmediateContext(&g_d11Context);
+        if (!g_d11Context) {
+            LOG_ERROR("Failed to acquire D3D11 device context!");
+            return false;
+        }
+
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+        static const char* fontPath = "C:\\Windows\\Fonts\\segoeui.ttf";
+        if (std::filesystem::exists(fontPath)) {
+            io.Fonts->AddFontFromFileTTF(fontPath, 22.0f);
+        }
+
+        apply_overlay_style();
+        ui_settings::reset_ui_scale_cache();
+        ImGui_ImplWin32_Init(g_window);
+        ImGui_ImplDX11_Init(g_d11Device, g_d11Context);
+
+        g_originalWndProc = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtr(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(wnd_proc)));
+
+        g_initialized.store(true);
+        LOG_INFO("ImGui DX11 overlay initialized successfully.");
+        return true;
+    }
+
+    void render_imgui_dx11(IDXGISwapChain* swapChain) {
+        ID3D11Texture2D* backBuffer = nullptr;
+        if (FAILED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backBuffer))) || !backBuffer) {
+            return;
+        }
+
+        ID3D11RenderTargetView* rtv = nullptr;
+        const HRESULT hr = g_d11Device->CreateRenderTargetView(backBuffer, nullptr, &rtv);
+        backBuffer->Release();
+        if (FAILED(hr) || !rtv) {
+            return;
+        }
+
+        g_d11Context->OMSetRenderTargets(1, &rtv, nullptr);
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ui_settings::apply_ui_scale();
+        ImGui::NewFrame();
+
+        ModuleManager::instance().on_imgui_render();
+
+        if (g_menuOpen.load()) {
+            clickgui::render();
+        }
+
+        ImGui::Render();
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        rtv->Release();
+    }
+
+    HRESULT __stdcall hook_present_dx11(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
+        if (!g_shuttingDown.load()) {
+            std::lock_guard lock(g_mutex);
+
+            const int skipFrames = g_skipFrames.load();
+            const unsigned long long now = GetTickCount64();
+            const bool inCooldown = now < g_resumeRenderAtTick.load();
+
+            if (skipFrames > 0 || inCooldown) {
+                if (skipFrames > 0) {
+                    g_skipFrames.store(skipFrames - 1);
+                }
+
+                if (g_initialized.load()) {
+                    cleanup_imgui();
+                }
+
+                return g_originalPresent11(swapChain, syncInterval, flags);
+            }
+
+            if (!g_initialized.load()) {
+                initialize_imgui_dx11(swapChain);
+            }
+
+            if (g_initialized.load()) {
+                render_imgui_dx11(swapChain);
+            }
+        }
+
+        return g_originalPresent11(swapChain, syncInterval, flags);
+    }
+
+    HRESULT __stdcall hook_resize_buffers_dx11(
+        IDXGISwapChain* swapChain,
+        UINT bufferCount,
+        UINT width,
+        UINT height,
+        DXGI_FORMAT newFormat,
+        UINT swapChainFlags) {
+        std::lock_guard lock(g_mutex);
+
+        if (g_initialized.load()) {
+            cleanup_imgui();
+        }
+
+        return g_originalResizeBuffers11(swapChain, bufferCount, width, height, newFormat, swapChainFlags);
+    }
+
     void __stdcall hook_execute_command_lists(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
         if (!g_commandQueue && queue) {
             g_commandQueue = queue;
@@ -5233,8 +5379,31 @@ namespace dx12_hook {
         LOG_INFO("Initializing Kiero D3D12 hook...");
 
         if (kiero::init(kiero::RenderType::D3D12) != kiero::Status::Success) {
-            LOG_ERROR("Failed to initialize Kiero D3D12!");
-            return false;
+            LOG_WARN("Kiero D3D12 unavailable (the game is probably running on DirectX 11). Falling back to D3D11...");
+
+            if (kiero::init(kiero::RenderType::D3D11) != kiero::Status::Success) {
+                LOG_ERROR("Failed to initialize Kiero D3D11 as well!");
+                return false;
+            }
+
+            // IDXGISwapChain vtable: Present = 8, ResizeBuffers = 13
+            constexpr uint16_t presentIndex11 = 8;
+            constexpr uint16_t resizeBuffersIndex11 = 13;
+
+            g_useDx11 = true;
+
+            if (kiero::bind(presentIndex11, reinterpret_cast<void**>(&g_originalPresent11), hook_present_dx11) != kiero::Status::Success) {
+                LOG_ERROR("Failed to bind D3D11 Present hook!");
+                return false;
+            }
+
+            if (kiero::bind(resizeBuffersIndex11, reinterpret_cast<void**>(&g_originalResizeBuffers11), hook_resize_buffers_dx11) != kiero::Status::Success) {
+                LOG_ERROR("Failed to bind D3D11 ResizeBuffers hook!");
+                return false;
+            }
+
+            LOG_INFO("DX11 hooks bound successfully.");
+            return true;
         }
 
         constexpr uint16_t executeCommandListsIndex = 54;
